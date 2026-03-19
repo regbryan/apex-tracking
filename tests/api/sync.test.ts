@@ -42,8 +42,7 @@ describe('POST /api/sync', () => {
     // Lock acquisition returns 0 rows updated
     mockFrom.mockReturnValueOnce({
       update: vi.fn().mockReturnThis(),
-      is: vi.fn().mockReturnThis(),
-      lt: vi.fn().mockReturnThis(),
+      or: vi.fn().mockReturnThis(),
       select: vi.fn().mockResolvedValue({ data: [], error: null }),
     } as any)
 
@@ -59,8 +58,7 @@ describe('POST /api/sync', () => {
     // Lock acquired
     mockFrom.mockReturnValueOnce({
       update: vi.fn().mockReturnThis(),
-      is: vi.fn().mockReturnThis(),
-      lt: vi.fn().mockReturnThis(),
+      or: vi.fn().mockReturnThis(),
       select: vi.fn().mockResolvedValue({ data: [{ id: 1 }], error: null }),
     } as any)
 

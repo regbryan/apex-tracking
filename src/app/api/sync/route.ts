@@ -24,8 +24,7 @@ export async function POST(request: NextRequest) {
   const { data: lockAcquired } = await supabase
     .from('sync_locks')
     .update({ locked_at: new Date().toISOString(), locked_by: runId })
-    .is('locked_at', null)
-    .lt('locked_at', lockCutoff)
+    .or(`locked_at.is.null,locked_at.lt.${lockCutoff}`)
     .select()
 
   if (!lockAcquired || lockAcquired.length === 0) {
