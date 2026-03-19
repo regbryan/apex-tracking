@@ -17,8 +17,8 @@ export interface MemberAggregate {
   last_click_date: string | null
   last_pageview_date: string | null
   last_download_date: string | null
-  pages_visited: string
-  downloads: string
+  pages_visited: string | null
+  downloads: string | null
 }
 
 export async function getSalesforceToken(config: SFTokenConfig): Promise<SFToken> {
@@ -52,8 +52,8 @@ export function buildCompositeUpdateRecords(aggregates: MemberAggregate[]) {
     ...(a.last_click_date && { Last_Click_Date__c: a.last_click_date }),
     ...(a.last_pageview_date && { Last_Page_View_Date__c: a.last_pageview_date }),
     ...(a.last_download_date && { Last_Download_Date__c: a.last_download_date }),
-    ...(a.pages_visited && { Pages_Visited__c: a.pages_visited }),
-    ...(a.downloads && { Downloads__c: a.downloads }),
+    ...(a.pages_visited != null && a.pages_visited !== '' && { Pages_Visited__c: a.pages_visited }),
+    ...(a.downloads != null && a.downloads !== '' && { Downloads__c: a.downloads }),
   }))
 }
 

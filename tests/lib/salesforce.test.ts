@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest'
-import { getSalesforceToken, buildCompositeUpdateRecords } from '@/lib/salesforce'
+import { getSalesforceToken, buildCompositeUpdateRecords, batchUpdateCampaignMembers } from '@/lib/salesforce'
 
 describe('getSalesforceToken', () => {
   beforeEach(() => {
@@ -72,5 +72,77 @@ describe('buildCompositeUpdateRecords', () => {
     // null/empty fields should not be present in output
     expect(records[0]).not.toHaveProperty('Last_Download_Date__c')
     expect(records[0]).not.toHaveProperty('Downloads__c')
+  })
+})
+
+describe('batchUpdateCampaignMembers', () => {
+  const mockToken = { access_token: 'tok', instance_url: 'https://test.salesforce.com' }
+  const apiVersion = 'v59.0'
+
+  beforeEach(() => {
+    vi.stubGlobal('fetch', vi.fn())
+  })
+
+  it('returns empty failedIds on full success', async () => {
+    const mockFetch = vi.mocked(fetch)
+    mockFetch.mockResolvedValueOnce({
+      ok: true,
+      json: async () => [
+        { success: true, id: 'MEM001' },
+        { success: true, id: 'MEM002' },
+      ],
+    } as Response)
+
+    const records = [
+      { attributes: { type: 'CampaignMember' }, Id: 'MEM001', Total_Clicks__c: 1, Unique_Clicks__c: 1 },
+      { attributes: { type: 'CampaignMember' }, Id: 'MEM002', Total_Clicks__c: 2, Unique_Clicks__c: 1 },
+    ]
+
+    const result = await batchUpdateCampaignMembers(records, mockToken, apiVersion)
+    expect(result.failedIds).toEqual([])
+  })
+
+  it('collects individual failed member IDs from partial response failure', async () => {
+    const mockFetch = vi.mocked(fetch)
+    mockFetch.mockResolvedValueOnce({
+      ok: true,
+      json: async () => [
+        { success: true, id: 'MEM001' },
+        { success: false, errors: [{ message: 'Not found' }] },
+      ],
+    } as Response)
+
+    const records = [
+      { attributes: { type: 'CampaignMember' }, Id: 'MEM001', Total_Clicks__c: 1, Unique_Clicks__c: 1 },
+      { attributes: { type: 'CampaignMember' }, Id: 'MEM002', Total_Clicks__c: 2, Unique_Clicks__c: 1 },
+    ]
+
+    const result = await batchUpdateCampaignMembers(records, mockToken, apiVersion)
+    expect(result.failedIds).toEqual(['MEM002'])
+  })
+
+  it('marks entire batch as failed on HTTP error and continues to next batch', async () => {
+    const mockFetch = vi.mocked(fetch)
+    // First batch: HTTP failure
+    mockFetch.mockResolvedValueOnce({ ok: false } as Response)
+    // Second batch: success
+    mockFetch.mockResolvedValueOnce({
+      ok: true,
+      json: async () => [{ success: true, id: 'MEM201' }],
+    } as Response)
+
+    // Create 201 records to force 2 batches (200 + 1)
+    const records = Array.from({ length: 201 }, (_, i) => ({
+      attributes: { type: 'CampaignMember' },
+      Id: `MEM${String(i + 1).padStart(3, '0')}`,
+      Total_Clicks__c: 1,
+      Unique_Clicks__c: 1,
+    }))
+
+    const result = await batchUpdateCampaignMembers(records, mockToken, apiVersion)
+    // First 200 failed, last 1 succeeded
+    expect(result.failedIds).toHaveLength(200)
+    expect(result.failedIds[0]).toBe('MEM001')
+    expect(result.failedIds[199]).toBe('MEM200')
   })
 })
