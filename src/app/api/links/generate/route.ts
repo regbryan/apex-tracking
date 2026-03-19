@@ -13,7 +13,7 @@ export async function POST(request: NextRequest) {
   const { campaign_id, member_ids, destination_url, file_url } = body
 
   // Validate required fields
-  if (!campaign_id || !Array.isArray(member_ids)) {
+  if (!campaign_id || !Array.isArray(member_ids) || member_ids.length === 0) {
     return new NextResponse('Missing required fields: campaign_id and member_ids', { status: 400 })
   }
 

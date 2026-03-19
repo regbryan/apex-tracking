@@ -107,4 +107,20 @@ describe('POST /api/links/generate', () => {
     ) as any)
     expect(response.status).toBe(400)
   })
+
+  it('returns 400 when member_ids is an empty array', async () => {
+    const response = await POST(makeRequest(
+      { campaign_id: 'C1', member_ids: [], destination_url: 'https://x.com' },
+      'Bearer test-secret'
+    ) as any)
+    expect(response.status).toBe(400)
+  })
+
+  it('returns 400 when member_ids is not an array', async () => {
+    const response = await POST(makeRequest(
+      { campaign_id: 'C1', member_ids: 'not-an-array', destination_url: 'https://x.com' },
+      'Bearer test-secret'
+    ) as any)
+    expect(response.status).toBe(400)
+  })
 })
