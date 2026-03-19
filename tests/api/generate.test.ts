@@ -124,6 +124,38 @@ describe('POST /api/links/generate', () => {
     expect(response.status).toBe(400)
   })
 
+  it('returns 400 when body is not valid JSON', async () => {
+    const validSecret = 'test-secret'
+    const request = new Request('http://localhost/api/links/generate', {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${validSecret}`,
+        'Content-Type': 'application/json',
+      },
+      body: '{invalid json',
+    })
+    const response = await POST(request as any)
+    expect(response.status).toBe(400)
+    const data = await response.json()
+    expect(data.error).toBe('Invalid JSON body')
+  })
+
+  it('returns 400 when member_ids contains an empty string element', async () => {
+    const response = await POST(makeRequest(
+      { campaign_id: 'C1', member_ids: ['M1', ''], destination_url: 'https://x.com' },
+      'Bearer test-secret'
+    ) as any)
+    expect(response.status).toBe(400)
+  })
+
+  it('returns 400 when member_ids contains a non-string element', async () => {
+    const response = await POST(makeRequest(
+      { campaign_id: 'C1', member_ids: ['M1', 42], destination_url: 'https://x.com' },
+      'Bearer test-secret'
+    ) as any)
+    expect(response.status).toBe(400)
+  })
+
   it('returns 500 when database insert fails', async () => {
     const mockFrom = vi.mocked(supabase.from)
     mockFrom.mockReturnValueOnce({
