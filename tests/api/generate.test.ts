@@ -123,4 +123,17 @@ describe('POST /api/links/generate', () => {
     ) as any)
     expect(response.status).toBe(400)
   })
+
+  it('returns 500 when database insert fails', async () => {
+    const mockFrom = vi.mocked(supabase.from)
+    mockFrom.mockReturnValueOnce({
+      insert: vi.fn().mockResolvedValue({ error: { message: 'DB error' } }),
+    } as any)
+
+    const response = await POST(makeRequest(
+      { campaign_id: 'C1', member_ids: ['M1'], destination_url: 'https://x.com' },
+      'Bearer test-secret'
+    ) as any)
+    expect(response.status).toBe(500)
+  })
 })

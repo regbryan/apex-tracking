@@ -9,12 +9,26 @@ export async function POST(request: NextRequest) {
     return new NextResponse('Unauthorized', { status: 401 })
   }
 
-  const body = await request.json()
-  const { campaign_id, member_ids, destination_url, file_url } = body
+  let body: unknown
+  try {
+    body = await request.json()
+  } catch {
+    return NextResponse.json({ error: 'Invalid JSON body' }, { status: 400 })
+  }
+  const { campaign_id, destination_url, file_url, member_ids } = body as {
+    campaign_id?: string
+    destination_url?: string | null
+    file_url?: string | null
+    member_ids?: unknown
+  }
 
   // Validate required fields
   if (!campaign_id || !Array.isArray(member_ids) || member_ids.length === 0) {
     return new NextResponse('Missing required fields: campaign_id and member_ids', { status: 400 })
+  }
+
+  if (member_ids.some((id: unknown) => typeof id !== 'string' || id.trim() === '')) {
+    return NextResponse.json({ error: 'All member_ids must be non-empty strings' }, { status: 400 })
   }
 
   // Exactly one of destination_url or file_url must be set
