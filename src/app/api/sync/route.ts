@@ -11,6 +11,16 @@ import { randomUUID } from 'crypto'
 
 const LOCK_TIMEOUT_MINUTES = 10
 
+interface TrackingEventRow {
+  member_id: string
+  campaign_id: string
+  event_type: 'click' | 'pageview' | 'download'
+  page_url: string | null
+  file_name: string | null
+  created_at: string
+  sequence_id: number
+}
+
 export async function POST(request: NextRequest) {
   const authHeader = request.headers.get('authorization')
   if (!validateBearerToken(authHeader, process.env.CRON_SECRET!)) {
@@ -49,7 +59,7 @@ export async function POST(request: NextRequest) {
     const { data: newEvents, error: eventsError } = await supabase
       .from('tracking_events')
       .select('member_id, campaign_id, event_type, page_url, file_name, created_at, sequence_id')
-      .gt('sequence_id', lastSequenceId)
+      .gt('sequence_id', lastSequenceId) as { data: TrackingEventRow[] | null, error: any }
 
     if (eventsError) throw new Error(`Events query failed: ${eventsError.message}`)
 
@@ -59,10 +69,10 @@ export async function POST(request: NextRequest) {
       return result
     }
 
-    const maxSequenceId = Math.max(...newEvents.map((e: any) => e.sequence_id))
+    const maxSequenceId = Math.max(...newEvents.map((e) => e.sequence_id))
 
     // --- Step 4: Aggregate per member ---
-    const affectedMemberIds = [...new Set(newEvents.map((e: any) => e.member_id))]
+    const affectedMemberIds = [...new Set(newEvents.map((e) => e.member_id))]
     const aggregates = await buildAggregates(affectedMemberIds, newEvents)
 
     // --- Step 5: Sync to Salesforce ---
@@ -96,13 +106,13 @@ export async function POST(request: NextRequest) {
   } finally {
     // IMPORTANT: releaseLock() is in finally — it runs on success, error, AND any unhandled throw.
     // Do NOT move this into try or catch only — either path could skip it if an exception occurs.
-    await releaseLock()
+    await releaseLock(runId)
   }
 }
 
 async function buildAggregates(
   memberIds: string[],
-  newEvents: any[]
+  newEvents: TrackingEventRow[]
 ): Promise<MemberAggregate[]> {
   // Unique Clicks requires ALL historical click events (not just new batch) to compute
   // accurate distinct-day counts across sync windows. Fetch all click events for affected members.
@@ -112,49 +122,49 @@ async function buildAggregates(
     .in('member_id', memberIds)
     .eq('event_type', 'click')
 
-  const allClicksByMember: Record<string, any[]> = {}
+  const allClicksByMember: Record<string, { member_id: string; created_at: string }[]> = {}
   for (const e of allClickEvents ?? []) {
     if (!allClicksByMember[e.member_id]) allClicksByMember[e.member_id] = []
     allClicksByMember[e.member_id].push(e)
   }
 
   return memberIds.map((memberId) => {
-    const memberEvents = newEvents.filter((e: any) => e.member_id === memberId)
-    const clickEvents = memberEvents.filter((e: any) => e.event_type === 'click')
-    const pageviewEvents = memberEvents.filter((e: any) => e.event_type === 'pageview')
-    const downloadEvents = memberEvents.filter((e: any) => e.event_type === 'download')
+    const memberEvents = newEvents.filter((e) => e.member_id === memberId)
+    const clickEvents = memberEvents.filter((e) => e.event_type === 'click')
+    const pageviewEvents = memberEvents.filter((e) => e.event_type === 'pageview')
+    const downloadEvents = memberEvents.filter((e) => e.event_type === 'download')
 
     // Unique clicks = distinct UTC calendar days across ALL historical clicks (not just new batch)
     // This correctly handles clicks that span multiple sync windows on the same calendar day.
     const allMemberClicks = allClicksByMember[memberId] ?? []
     const uniqueDays = new Set(
-      allMemberClicks.map((e: any) =>
+      allMemberClicks.map((e) =>
         new Date(e.created_at).toISOString().split('T')[0]
       )
     )
 
     const sortedClicks = clickEvents.sort(
-      (a: any, b: any) => new Date(a.created_at).getTime() - new Date(b.created_at).getTime()
+      (a, b) => new Date(a.created_at).getTime() - new Date(b.created_at).getTime()
     )
 
     const pageUrls = [
       ...new Set(
         [...clickEvents, ...pageviewEvents]
-          .map((e: any) => e.page_url)
+          .map((e) => e.page_url)
           .filter(Boolean)
       ),
     ].slice(0, 100)
 
     const fileNames = [
-      ...new Set(downloadEvents.map((e: any) => e.file_name).filter(Boolean)),
+      ...new Set(downloadEvents.map((e) => e.file_name).filter(Boolean)),
     ].slice(0, 100)
 
     const lastPageview = pageviewEvents.sort(
-      (a: any, b: any) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime()
+      (a, b) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime()
     )[0]
 
     const lastDownload = downloadEvents.sort(
-      (a: any, b: any) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime()
+      (a, b) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime()
     )[0]
 
     return {
@@ -174,11 +184,11 @@ async function buildAggregates(
 async function writeSyncLog(
   recordsProcessed: number,
   lastSequenceId: number,
-  status: string,
+  status: 'success' | 'partial' | 'failed',
   failedMemberIds: string[],
   errorDetail?: string
 ) {
-  await supabase.from('sync_log').insert([
+  const { error } = await supabase.from('sync_log').insert([
     {
       records_processed: recordsProcessed,
       last_sequence_id: lastSequenceId,
@@ -187,11 +197,17 @@ async function writeSyncLog(
       error_detail: errorDetail ?? null,
     },
   ])
+  if (error) {
+    console.error('[sync] Failed to write sync_log:', error.message)
+  }
 }
 
-async function releaseLock() {
-  await supabase
+async function releaseLock(runId: string) {
+  const result = await supabase
     .from('sync_locks')
     .update({ locked_at: null, locked_by: null })
-    .eq('id', 1)
+    .eq('locked_by', runId)
+  if (result.error) {
+    console.error('[sync] Failed to release lock:', result.error.message)
+  }
 }
