@@ -29,17 +29,25 @@ export async function GET(request: NextRequest) {
 
   // IMPORTANT: Must await — Vercel freezes execution context immediately after response is sent,
   // so unawaited promises are silently dropped and the event would never be logged.
-  await supabase.from('tracking_events').insert([
+  const { error: insertError } = await supabase.from('tracking_events').insert([
     {
       tracked_link_id: link.id,
       campaign_id: link.campaign_id,
       member_id: link.member_id,
       event_type: eventType,
       page_url: link.destination_url,
-      ip_address: request.headers.get('x-forwarded-for') ?? request.headers.get('x-real-ip'),
+      ip_address: (request.headers.get('x-forwarded-for') ?? '').split(',')[0].trim()
+                 || request.headers.get('x-real-ip'),
       user_agent: request.headers.get('user-agent'),
     },
   ])
+
+  if (insertError) {
+    console.error('[track] Failed to log event:', insertError.message)
+    // Still redirect — don't break the user's link, but don't set cookie either
+    // (next visit will retry as a click, preserving data integrity)
+    return NextResponse.redirect(link.destination_url, { status: 302 })
+  }
 
   // Build redirect response
   const response = NextResponse.redirect(link.destination_url, { status: 302 })

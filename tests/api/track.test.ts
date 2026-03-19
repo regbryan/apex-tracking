@@ -35,15 +35,18 @@ describe('GET /api/track', () => {
       eq: vi.fn().mockReturnThis(),
       single: vi.fn().mockResolvedValue({ data: mockLink, error: null }),
     } as any)
-    mockFrom.mockReturnValueOnce({
-      insert: vi.fn().mockResolvedValue({ error: null }),
-    } as any)
+
+    const insertMock = vi.fn().mockResolvedValue({ error: null })
+    mockFrom.mockReturnValueOnce({ insert: insertMock } as any)
 
     const response = await GET(makeRequest('valid-token') as any)
 
     expect(response.status).toBe(302)
     expect(response.headers.get('location')).toBe('https://destination.com/page')
     expect(response.headers.get('set-cookie')).toContain('apex_track_valid-token')
+    expect(insertMock).toHaveBeenCalledWith(
+      expect.arrayContaining([expect.objectContaining({ event_type: 'click' })])
+    )
   })
 
   it('redirects to fallback URL on unknown token', async () => {
@@ -78,12 +81,20 @@ describe('GET /api/track', () => {
     const insertMock = vi.fn().mockResolvedValue({ error: null })
     mockFrom.mockReturnValueOnce({ insert: insertMock } as any)
 
-    await GET(makeRequest('valid-token', 'apex_track_valid-token=1') as any)
+    const response = await GET(makeRequest('valid-token', 'apex_track_valid-token=1') as any)
 
     expect(insertMock).toHaveBeenCalledWith(
       expect.arrayContaining([
         expect.objectContaining({ event_type: 'pageview' }),
       ])
     )
+    expect(response.headers.get('set-cookie')).toBeNull()
+  })
+
+  it('redirects to fallback when no token in query string', async () => {
+    const request = new Request('http://localhost/api/track') as any
+    const response = await GET(request)
+    expect(response.status).toBe(302)
+    expect(response.headers.get('location')).toBe('https://track.example.com')
   })
 })
