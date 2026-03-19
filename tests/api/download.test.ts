@@ -87,4 +87,27 @@ describe('GET /api/download', () => {
     const response = await GET(makeRequest() as any)
     expect(response.status).toBe(404)
   })
+
+  it('returns 404 when insert fails', async () => {
+    const mockLink = {
+      id: 'link-uuid',
+      campaign_id: 'CAM001',
+      member_id: 'MEM001',
+      file_url: 'https://cdn.example.com/brochure.pdf',
+    }
+
+    const mockFrom = vi.mocked(supabase.from)
+    mockFrom.mockReturnValueOnce({
+      select: vi.fn().mockReturnThis(),
+      eq: vi.fn().mockReturnThis(),
+      single: vi.fn().mockResolvedValue({ data: mockLink, error: null }),
+    } as any)
+    mockFrom.mockReturnValueOnce({
+      insert: vi.fn().mockResolvedValue({ error: { message: 'db connection error' } }),
+    } as any)
+
+    const response = await GET(makeRequest('valid-token') as any)
+
+    expect(response.status).toBe(404)
+  })
 })
