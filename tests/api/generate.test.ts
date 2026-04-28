@@ -168,4 +168,216 @@ describe('POST /api/links/generate', () => {
     ) as any)
     expect(response.status).toBe(500)
   })
+
+  it('auto-extracts UTM params from destination_url', async () => {
+    const insertSpy = vi.fn().mockResolvedValue({ error: null })
+    vi.mocked(supabase.from).mockReturnValueOnce({ insert: insertSpy } as any)
+
+    const response = await POST(makeRequest(
+      {
+        campaign_id: 'C1',
+        member_ids: ['M1'],
+        destination_url: 'https://site.com/page?utm_source=outbound&utm_medium=email&utm_campaign=q2-acme',
+      },
+      'Bearer test-secret'
+    ) as any)
+
+    expect(response.status).toBe(200)
+    const inserted = insertSpy.mock.calls[0][0]
+    expect(inserted[0]).toMatchObject({
+      utm_source: 'outbound',
+      utm_medium: 'email',
+      utm_campaign: 'q2-acme',
+      utm_term: null,
+      utm_content: null,
+    })
+  })
+
+  it('explicit utm body fields override URL-extracted values', async () => {
+    const insertSpy = vi.fn().mockResolvedValue({ error: null })
+    vi.mocked(supabase.from).mockReturnValueOnce({ insert: insertSpy } as any)
+
+    const response = await POST(makeRequest(
+      {
+        campaign_id: 'C1',
+        member_ids: ['M1'],
+        destination_url: 'https://site.com/page?utm_source=fromurl&utm_campaign=fromurl',
+        utm: { source: 'override', term: 'kw' },
+      },
+      'Bearer test-secret'
+    ) as any)
+
+    expect(response.status).toBe(200)
+    const inserted = insertSpy.mock.calls[0][0]
+    expect(inserted[0]).toMatchObject({
+      utm_source: 'override',       // body override wins
+      utm_campaign: 'fromurl',      // not overridden, URL value persists
+      utm_term: 'kw',               // body-only
+      utm_medium: null,
+      utm_content: null,
+    })
+  })
+
+  it('persists nulls for all UTM fields when none provided and URL has none', async () => {
+    const insertSpy = vi.fn().mockResolvedValue({ error: null })
+    vi.mocked(supabase.from).mockReturnValueOnce({ insert: insertSpy } as any)
+
+    const response = await POST(makeRequest(
+      { campaign_id: 'C1', member_ids: ['M1'], destination_url: 'https://site.com/page' },
+      'Bearer test-secret'
+    ) as any)
+
+    expect(response.status).toBe(200)
+    const inserted = insertSpy.mock.calls[0][0]
+    expect(inserted[0]).toMatchObject({
+      utm_source: null,
+      utm_medium: null,
+      utm_campaign: null,
+      utm_term: null,
+      utm_content: null,
+    })
+  })
+
+  it('handles malformed destination_url gracefully (no UTMs extracted)', async () => {
+    const insertSpy = vi.fn().mockResolvedValue({ error: null })
+    vi.mocked(supabase.from).mockReturnValueOnce({ insert: insertSpy } as any)
+
+    // not a valid URL — extract returns all nulls, body-supplied utm still applied
+    const response = await POST(makeRequest(
+      {
+        campaign_id: 'C1',
+        member_ids: ['M1'],
+        destination_url: 'not-a-url',
+        utm: { source: 'x' },
+      },
+      'Bearer test-secret'
+    ) as any)
+
+    expect(response.status).toBe(200)
+    const inserted = insertSpy.mock.calls[0][0]
+    expect(inserted[0]).toMatchObject({ utm_source: 'x', utm_medium: null })
+  })
+
+  it('ignores empty-string and non-string utm body values', async () => {
+    const insertSpy = vi.fn().mockResolvedValue({ error: null })
+    vi.mocked(supabase.from).mockReturnValueOnce({ insert: insertSpy } as any)
+
+    const response = await POST(makeRequest(
+      {
+        campaign_id: 'C1',
+        member_ids: ['M1'],
+        destination_url: 'https://site.com?utm_source=fallback',
+        utm: { source: '', medium: 42, campaign: 'real' },
+      },
+      'Bearer test-secret'
+    ) as any)
+
+    expect(response.status).toBe(200)
+    const inserted = insertSpy.mock.calls[0][0]
+    expect(inserted[0]).toMatchObject({
+      utm_source: 'fallback',  // empty-string body value ignored, URL fallback wins
+      utm_medium: null,        // non-string body value ignored
+      utm_campaign: 'real',
+    })
+  })
+
+  it('accepts recipients shape with contact_id + account_id (no campaign_id required)', async () => {
+    const insertSpy = vi.fn().mockResolvedValue({ error: null })
+    vi.mocked(supabase.from).mockReturnValueOnce({ insert: insertSpy } as any)
+
+    const response = await POST(makeRequest(
+      {
+        destination_url: 'https://site.com/page',
+        recipients: [{ contact_id: '003xx0000000001', account_id: '001xx0000000001' }],
+      },
+      'Bearer test-secret'
+    ) as any)
+
+    expect(response.status).toBe(200)
+    const inserted = insertSpy.mock.calls[0][0]
+    expect(inserted[0]).toMatchObject({
+      contact_id: '003xx0000000001',
+      account_id: '001xx0000000001',
+      lead_id: null,
+      member_id: null,
+      campaign_id: null,
+    })
+    const body = await response.json()
+    expect(body[0]).toMatchObject({
+      contact_id: '003xx0000000001',
+      account_id: '001xx0000000001',
+    })
+  })
+
+  it('accepts recipients with lead_id only (lead has no AccountId until conversion)', async () => {
+    const insertSpy = vi.fn().mockResolvedValue({ error: null })
+    vi.mocked(supabase.from).mockReturnValueOnce({ insert: insertSpy } as any)
+
+    const response = await POST(makeRequest(
+      {
+        destination_url: 'https://site.com/page',
+        recipients: [{ lead_id: '00Qxx0000000001' }],
+      },
+      'Bearer test-secret'
+    ) as any)
+
+    expect(response.status).toBe(200)
+    const inserted = insertSpy.mock.calls[0][0]
+    expect(inserted[0]).toMatchObject({
+      lead_id: '00Qxx0000000001',
+      contact_id: null,
+      account_id: null,
+    })
+  })
+
+  it('returns 400 when recipient has no identifiers', async () => {
+    const response = await POST(makeRequest(
+      {
+        destination_url: 'https://site.com/page',
+        recipients: [{ contact_id: '003xx0000000001' }, {}],
+      },
+      'Bearer test-secret'
+    ) as any)
+    expect(response.status).toBe(400)
+  })
+
+  it('returns 400 when both member_ids and recipients are provided', async () => {
+    const response = await POST(makeRequest(
+      {
+        campaign_id: 'C1',
+        destination_url: 'https://site.com/page',
+        member_ids: ['M1'],
+        recipients: [{ contact_id: '003xx0000000001' }],
+      },
+      'Bearer test-secret'
+    ) as any)
+    expect(response.status).toBe(400)
+  })
+
+  it('returns 400 when neither member_ids nor recipients are provided', async () => {
+    const response = await POST(makeRequest(
+      { campaign_id: 'C1', destination_url: 'https://site.com/page' },
+      'Bearer test-secret'
+    ) as any)
+    expect(response.status).toBe(400)
+  })
+
+  it('legacy member_ids path still requires campaign_id', async () => {
+    const response = await POST(makeRequest(
+      { destination_url: 'https://site.com/page', member_ids: ['M1'] },
+      'Bearer test-secret'
+    ) as any)
+    expect(response.status).toBe(400)
+  })
+
+  it('trims whitespace and treats empty recipient strings as missing', async () => {
+    const response = await POST(makeRequest(
+      {
+        destination_url: 'https://site.com/page',
+        recipients: [{ contact_id: '   ', lead_id: '' }],
+      },
+      'Bearer test-secret'
+    ) as any)
+    expect(response.status).toBe(400)
+  })
 })

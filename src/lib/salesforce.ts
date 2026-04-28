@@ -9,16 +9,45 @@ export interface SFToken {
   instance_url: string
 }
 
-export interface MemberAggregate {
-  member_id: string
-  total_clicks: number
-  unique_clicks: number
-  first_click_date: string | null
-  last_click_date: string | null
-  last_pageview_date: string | null
-  last_download_date: string | null
-  pages_visited: string | null
-  downloads: string | null
+// One row per tracking_events record, joined with its parent tracked_links UTMs.
+// Only events with a resolved account_id can be turned into signals — Account__c is
+// master-detail required on the Salesforce side.
+export interface TrackingEventForSignal {
+  event_id: string
+  account_id: string
+  contact_id: string | null
+  lead_id: string | null
+  campaign_id: string | null
+  event_type: 'click' | 'pageview' | 'download'
+  created_at: string
+  utm_source: string | null
+  utm_medium: string | null
+  utm_campaign: string | null
+  utm_term: string | null
+  utm_content: string | null
+}
+
+export interface AccountSignalRecord {
+  attributes: { type: 'Account_Signal__c' }
+  External_Id__c: string
+  Account__c: string
+  Signal_Type__c: 'outreach_click' | 'web_visit' | 'content_download'
+  Source_System__c: 'ApexTracking'
+  Captured_At__c: string
+  Related_Contact__c?: string
+  Related_Lead__c?: string
+  Related_Campaign__c?: string
+  UTM_Source__c?: string
+  UTM_Medium__c?: string
+  UTM_Campaign__c?: string
+  UTM_Term__c?: string
+  UTM_Content__c?: string
+}
+
+const EVENT_TO_SIGNAL: Record<TrackingEventForSignal['event_type'], AccountSignalRecord['Signal_Type__c']> = {
+  click: 'outreach_click',
+  pageview: 'web_visit',
+  download: 'content_download',
 }
 
 export async function getSalesforceToken(config: SFTokenConfig): Promise<SFToken> {
@@ -42,34 +71,46 @@ export async function getSalesforceToken(config: SFTokenConfig): Promise<SFToken
   return response.json()
 }
 
-export function buildCompositeUpdateRecords(aggregates: MemberAggregate[]) {
-  return aggregates.map((a) => ({
-    attributes: { type: 'CampaignMember' },
-    Id: a.member_id,
-    Total_Clicks__c: a.total_clicks,
-    Unique_Clicks__c: a.unique_clicks,
-    ...(a.first_click_date && { First_Click_Date__c: a.first_click_date }),
-    ...(a.last_click_date && { Last_Click_Date__c: a.last_click_date }),
-    ...(a.last_pageview_date && { Last_Page_View_Date__c: a.last_pageview_date }),
-    ...(a.last_download_date && { Last_Download_Date__c: a.last_download_date }),
-    ...(a.pages_visited != null && a.pages_visited !== '' && { Pages_Visited__c: a.pages_visited }),
-    ...(a.downloads != null && a.downloads !== '' && { Downloads__c: a.downloads }),
-  }))
+export function buildAccountSignalRecords(events: TrackingEventForSignal[]): AccountSignalRecord[] {
+  return events.map((e) => {
+    const record: AccountSignalRecord = {
+      attributes: { type: 'Account_Signal__c' },
+      External_Id__c: e.event_id,
+      Account__c: e.account_id,
+      Signal_Type__c: EVENT_TO_SIGNAL[e.event_type],
+      Source_System__c: 'ApexTracking',
+      Captured_At__c: e.created_at,
+    }
+    // Optional lookups: only emit when populated. Salesforce treats explicit nulls as
+    // intentional clears, which is fine on insert but noisy on upsert — omit instead.
+    if (e.contact_id) record.Related_Contact__c = e.contact_id
+    if (e.lead_id) record.Related_Lead__c = e.lead_id
+    if (e.campaign_id) record.Related_Campaign__c = e.campaign_id
+    if (e.utm_source) record.UTM_Source__c = e.utm_source
+    if (e.utm_medium) record.UTM_Medium__c = e.utm_medium
+    if (e.utm_campaign) record.UTM_Campaign__c = e.utm_campaign
+    if (e.utm_term) record.UTM_Term__c = e.utm_term
+    if (e.utm_content) record.UTM_Content__c = e.utm_content
+    return record
+  })
 }
 
-export async function batchUpdateCampaignMembers(
-  records: ReturnType<typeof buildCompositeUpdateRecords>,
+// Upsert Account_Signal__c records by External_Id__c (the Supabase tracking_events.id UUID).
+// Idempotency comes from the External_Id__c unique constraint — re-running a sync window is safe.
+// The composite/sobjects upsert endpoint accepts up to 200 records per call.
+export async function upsertAccountSignals(
+  records: AccountSignalRecord[],
   token: SFToken,
   apiVersion: string
-): Promise<{ failedIds: string[] }> {
-  const failedIds: string[] = []
+): Promise<{ failedExternalIds: string[] }> {
+  const failedExternalIds: string[] = []
   const BATCH_SIZE = 200
 
   for (let i = 0; i < records.length; i += BATCH_SIZE) {
     const batch = records.slice(i, i + BATCH_SIZE)
 
     const response = await fetch(
-      `${token.instance_url}/services/data/${apiVersion}/composite/sobjects`,
+      `${token.instance_url}/services/data/${apiVersion}/composite/sobjects/Account_Signal__c/External_Id__c`,
       {
         method: 'PATCH',
         headers: {
@@ -81,8 +122,8 @@ export async function batchUpdateCampaignMembers(
     )
 
     if (!response.ok) {
-      // Entire batch failed — mark all member IDs in this batch as failed
-      batch.forEach((r) => failedIds.push(r.Id))
+      // Entire batch failed at the HTTP layer — mark all External_Id__c values as failed
+      batch.forEach((r) => failedExternalIds.push(r.External_Id__c))
       continue
     }
 
@@ -91,10 +132,10 @@ export async function batchUpdateCampaignMembers(
 
     results.forEach((result, index) => {
       if (!result.success) {
-        failedIds.push(batch[index].Id)
+        failedExternalIds.push(batch[index].External_Id__c)
       }
     })
   }
 
-  return { failedIds }
+  return { failedExternalIds }
 }

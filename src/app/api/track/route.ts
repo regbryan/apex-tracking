@@ -13,7 +13,7 @@ export async function GET(request: NextRequest) {
   // Look up the token
   const { data: link, error } = await supabase
     .from('tracked_links')
-    .select('id, campaign_id, member_id, destination_url')
+    .select('id, campaign_id, member_id, contact_id, lead_id, account_id, destination_url')
     .eq('token', token)
     .single()
 
@@ -34,6 +34,9 @@ export async function GET(request: NextRequest) {
       tracked_link_id: link.id,
       campaign_id: link.campaign_id,
       member_id: link.member_id,
+      contact_id: link.contact_id,
+      lead_id: link.lead_id,
+      account_id: link.account_id,
       event_type: eventType,
       page_url: link.destination_url,
       ip_address: (request.headers.get('x-forwarded-for') ?? '').split(',')[0].trim()

@@ -3,22 +3,49 @@ import { supabase } from '@/lib/supabase'
 import { validateBearerToken } from '@/lib/auth'
 import {
   getSalesforceToken,
-  buildCompositeUpdateRecords,
-  batchUpdateCampaignMembers,
-  MemberAggregate,
+  buildAccountSignalRecords,
+  upsertAccountSignals,
+  TrackingEventForSignal,
 } from '@/lib/salesforce'
 import { randomUUID } from 'crypto'
 
 const LOCK_TIMEOUT_MINUTES = 10
 
-interface TrackingEventRow {
-  member_id: string
-  campaign_id: string
+// Shape of a single tracking_events row joined with its parent tracked_links for UTMs.
+// Supabase returns the joined relation as a nested object (or array, depending on cardinality);
+// for a many-to-one FK like this, it's a single object — but the typings allow null/array,
+// so the code below handles both defensively.
+interface JoinedEventRow {
+  id: string
+  account_id: string | null
+  contact_id: string | null
+  lead_id: string | null
+  campaign_id: string | null
   event_type: 'click' | 'pageview' | 'download'
-  page_url: string | null
-  file_name: string | null
   created_at: string
   sequence_id: number
+  tracked_links: {
+    utm_source: string | null
+    utm_medium: string | null
+    utm_campaign: string | null
+    utm_term: string | null
+    utm_content: string | null
+  } | null | Array<{
+    utm_source: string | null
+    utm_medium: string | null
+    utm_campaign: string | null
+    utm_term: string | null
+    utm_content: string | null
+  }>
+}
+
+function flattenUtms(linkRel: JoinedEventRow['tracked_links']) {
+  const empty = {
+    utm_source: null, utm_medium: null, utm_campaign: null,
+    utm_term: null, utm_content: null,
+  }
+  if (!linkRel) return empty
+  return Array.isArray(linkRel) ? (linkRel[0] ?? empty) : linkRel
 }
 
 export async function POST(request: NextRequest) {
@@ -55,11 +82,18 @@ export async function POST(request: NextRequest) {
 
     lastSequenceId = lastLog?.last_sequence_id ?? 0
 
-    // --- Step 3: Fetch new events ---
+    // --- Step 3: Fetch new events with their parent tracked_links UTMs ---
+    // Filter to events with a resolved account_id — Account_Signal__c.Account__c is master-detail
+    // required, so events without account_id can't become signals. They stay in Supabase but
+    // are skipped from sync. The cursor still advances past them so we don't replay forever.
     const { data: newEvents, error: eventsError } = await supabase
       .from('tracking_events')
-      .select('member_id, campaign_id, event_type, page_url, file_name, created_at, sequence_id')
-      .gt('sequence_id', lastSequenceId) as { data: TrackingEventRow[] | null, error: any }
+      .select(`
+        id, account_id, contact_id, lead_id, campaign_id,
+        event_type, created_at, sequence_id,
+        tracked_links ( utm_source, utm_medium, utm_campaign, utm_term, utm_content )
+      `)
+      .gt('sequence_id', lastSequenceId) as { data: JoinedEventRow[] | null, error: any }
 
     if (eventsError) throw new Error(`Events query failed: ${eventsError.message}`)
 
@@ -71,30 +105,55 @@ export async function POST(request: NextRequest) {
 
     const maxSequenceId = Math.max(...newEvents.map((e) => e.sequence_id))
 
-    // --- Step 4: Aggregate per member ---
-    const affectedMemberIds = [...new Set(newEvents.map((e) => e.member_id))]
-    const aggregates = await buildAggregates(affectedMemberIds, newEvents)
+    // Filter to events that can become signals (must have account_id)
+    const syncable: TrackingEventForSignal[] = newEvents
+      .filter((e) => e.account_id)
+      .map((e) => {
+        const utms = flattenUtms(e.tracked_links)
+        return {
+          event_id: e.id,
+          account_id: e.account_id!,
+          contact_id: e.contact_id,
+          lead_id: e.lead_id,
+          campaign_id: e.campaign_id,
+          event_type: e.event_type,
+          created_at: e.created_at,
+          utm_source: utms.utm_source,
+          utm_medium: utms.utm_medium,
+          utm_campaign: utms.utm_campaign,
+          utm_term: utms.utm_term,
+          utm_content: utms.utm_content,
+        }
+      })
 
-    // --- Step 5: Sync to Salesforce ---
+    if (syncable.length === 0) {
+      // Advance the cursor past these unsyncable events so we don't reprocess them every run
+      await writeSyncLog(0, maxSequenceId, 'success', [])
+      result = NextResponse.json({ records_processed: 0, skipped: newEvents.length })
+      return result
+    }
+
+    // --- Step 4: Upsert to Salesforce ---
     const sfToken = await getSalesforceToken({
       clientId: process.env.SF_CLIENT_ID!,
       clientSecret: process.env.SF_CLIENT_SECRET!,
       instanceUrl: process.env.SF_INSTANCE_URL!,
     })
 
-    const records = buildCompositeUpdateRecords(aggregates)
-    const { failedIds } = await batchUpdateCampaignMembers(
+    const records = buildAccountSignalRecords(syncable)
+    const { failedExternalIds } = await upsertAccountSignals(
       records,
       sfToken,
       process.env.SF_API_VERSION ?? 'v59.0'
     )
 
-    const status = failedIds.length === 0 ? 'success' : 'partial'
-    await writeSyncLog(aggregates.length, maxSequenceId, status, failedIds)
+    const status = failedExternalIds.length === 0 ? 'success' : 'partial'
+    await writeSyncLog(syncable.length, maxSequenceId, status, failedExternalIds)
 
     result = NextResponse.json({
-      records_processed: aggregates.length,
-      failed_count: failedIds.length,
+      records_processed: syncable.length,
+      skipped: newEvents.length - syncable.length,
+      failed_count: failedExternalIds.length,
       status,
     })
     return result
@@ -110,82 +169,11 @@ export async function POST(request: NextRequest) {
   }
 }
 
-async function buildAggregates(
-  memberIds: string[],
-  newEvents: TrackingEventRow[]
-): Promise<MemberAggregate[]> {
-  // Unique Clicks requires ALL historical click events (not just new batch) to compute
-  // accurate distinct-day counts across sync windows. Fetch all click events for affected members.
-  const { data: allClickEvents } = await supabase
-    .from('tracking_events')
-    .select('member_id, created_at')
-    .in('member_id', memberIds)
-    .eq('event_type', 'click')
-
-  const allClicksByMember: Record<string, { member_id: string; created_at: string }[]> = {}
-  for (const e of allClickEvents ?? []) {
-    if (!allClicksByMember[e.member_id]) allClicksByMember[e.member_id] = []
-    allClicksByMember[e.member_id].push(e)
-  }
-
-  return memberIds.map((memberId) => {
-    const memberEvents = newEvents.filter((e) => e.member_id === memberId)
-    const clickEvents = memberEvents.filter((e) => e.event_type === 'click')
-    const pageviewEvents = memberEvents.filter((e) => e.event_type === 'pageview')
-    const downloadEvents = memberEvents.filter((e) => e.event_type === 'download')
-
-    // Unique clicks = distinct UTC calendar days across ALL historical clicks (not just new batch)
-    // This correctly handles clicks that span multiple sync windows on the same calendar day.
-    const allMemberClicks = allClicksByMember[memberId] ?? []
-    const uniqueDays = new Set(
-      allMemberClicks.map((e) =>
-        new Date(e.created_at).toISOString().split('T')[0]
-      )
-    )
-
-    const sortedClicks = clickEvents.sort(
-      (a, b) => new Date(a.created_at).getTime() - new Date(b.created_at).getTime()
-    )
-
-    const pageUrls = [
-      ...new Set(
-        [...clickEvents, ...pageviewEvents]
-          .map((e) => e.page_url)
-          .filter(Boolean)
-      ),
-    ].slice(0, 100)
-
-    const fileNames = [
-      ...new Set(downloadEvents.map((e) => e.file_name).filter(Boolean)),
-    ].slice(0, 100)
-
-    const lastPageview = pageviewEvents.sort(
-      (a, b) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime()
-    )[0]
-
-    const lastDownload = downloadEvents.sort(
-      (a, b) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime()
-    )[0]
-
-    return {
-      member_id: memberId,
-      total_clicks: clickEvents.length,
-      unique_clicks: uniqueDays.size,
-      first_click_date: sortedClicks[0]?.created_at ?? null,
-      last_click_date: sortedClicks[sortedClicks.length - 1]?.created_at ?? null,
-      last_pageview_date: lastPageview?.created_at ?? null,
-      last_download_date: lastDownload?.created_at ?? null,
-      pages_visited: pageUrls.join(','),
-      downloads: fileNames.join(','),
-    }
-  })
-}
-
 async function writeSyncLog(
   recordsProcessed: number,
   lastSequenceId: number,
   status: 'success' | 'partial' | 'failed',
-  failedMemberIds: string[],
+  failedExternalIds: string[],
   errorDetail?: string
 ) {
   const { error } = await supabase.from('sync_log').insert([
@@ -193,7 +181,7 @@ async function writeSyncLog(
       records_processed: recordsProcessed,
       last_sequence_id: lastSequenceId,
       status,
-      failed_member_ids: failedMemberIds.length > 0 ? failedMemberIds : null,
+      failed_member_ids: failedExternalIds.length > 0 ? failedExternalIds : null,
       error_detail: errorDetail ?? null,
     },
   ])
